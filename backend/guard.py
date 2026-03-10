@@ -101,7 +101,7 @@ _UNSAFE_PATTERNS: list[tuple[str, str]] = [
      "Unsafe input: contains threatening or self-harm language."),
 
     # Spam / abuse
-    (r"(.)\1{40,}",
+    (r"(?![-=*#_~/])(.)\1{80,}",
      "Unsafe input: spam — excessive repeated characters detected."),
     (r"[^\x00-\x7F]{200,}",
      "Unsafe input: possible encoding attack — excessive non-ASCII content."),
