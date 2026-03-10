@@ -428,6 +428,9 @@ async function streamGeneralAnswer() {
   }
 }
 
+// Holds the current proposed change so the edit modal can pre-populate fields
+let _currentReviewData = null;
+
 // ─── SSE event handler ────────────────────────────────────────────────────────
 // FIX: was a bare block before — must be a named function for streamPipeline/streamGeneralAnswer to call it
 function handleSSEEvent(ev) {
@@ -460,6 +463,8 @@ function handleSSEEvent(ev) {
     appendMessage(ev.message, 'assistant', 'text', true);
   }
   else if (ev.type === 'review_card') {
+    // Cache the proposed change so the edit modal can pre-populate fields
+    _currentReviewData = ev.change_data || null;
     // Render the card directly into the chat as HTML from Markdown
     const el = document.createElement('div');
     el.className = 'msg msg-assistant';
@@ -499,6 +504,7 @@ async function sendReview(decision) {
     appendMessage(userLabel, 'user', 'review_decision', true);
 
     if (data.status === 'next') {
+      _currentReviewData = data.change_data || null;
       const box2 = document.getElementById('chat-box');
       const el2  = document.createElement('div');
       el2.className = 'msg msg-assistant';
@@ -518,27 +524,148 @@ async function sendReview(decision) {
 }
 
 // ─── Edit modal ────────────────────────────────────────────────────────────────
+
+// Holds the current proposed change being edited so submitEdit can build the payload
+let _editChangeType = null;  // 'UPDATE' | 'CREATE'
+
+function _setSelect(id, value) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  for (const opt of el.options) {
+    if (opt.value === value) { opt.selected = true; return; }
+  }
+  // Value not in list — add it dynamically
+  const opt = document.createElement('option');
+  opt.value = opt.textContent = value;
+  el.appendChild(opt);
+  opt.selected = true;
+}
+
+function _buildAcRows(containerId, criteria) {
+  const container = document.getElementById(containerId);
+  container.innerHTML = '';
+  (criteria || []).forEach(ac => _appendAcRow(containerId, ac));
+}
+
+function _appendAcRow(containerId, value = '') {
+  const container = document.getElementById(containerId);
+  const row = document.createElement('div');
+  row.className = 'edit-ac-row';
+  row.innerHTML = `
+    <input type="text" class="edit-input edit-ac-input" value="${esc(value)}" placeholder="Given / When / Then…"/>
+    <button class="edit-ac-remove" onclick="this.parentElement.remove()">×</button>`;
+  container.appendChild(row);
+}
+
+function addAcRow()    { _appendAcRow('edit-ac-list'); }
+function addNewAcRow() { _appendAcRow('edit-new-ac-list'); }
+
 function showEditModal() {
-  document.getElementById('edit-json-input').value = '';
   document.getElementById('edit-error').textContent = '';
+  // If we already have the data cached from SSE, open immediately.
+  // Otherwise fetch it from the session status endpoint as a fallback.
+  if (_currentReviewData) {
+    _openEditModal(_currentReviewData);
+  } else {
+    _fetchAndOpenEditModal();
+  }
+}
+
+async function _fetchAndOpenEditModal() {
+  try {
+    const r    = await apiFetch(`/sessions/${currentConvId}/status`);
+    const data = await r.json();
+    const idx  = data.review_index || 0;
+
+    // Fetch the full proposed changes list via a dedicated endpoint
+    const r2   = await apiFetch(`/sessions/${currentConvId}/proposed`);
+    if (r2.ok) {
+      const proposed = await r2.json();
+      const change   = (proposed.changes || proposed)[idx];
+      if (change) {
+        _currentReviewData = change;
+        _openEditModal(change);
+        return;
+      }
+    }
+  } catch { /* fall through */ }
+  // Last resort — open with error message
+  document.getElementById('edit-modal').classList.remove('hidden');
+  document.getElementById('edit-error').textContent = 'Could not load change data. Please apply the main.py backend update.';
+}
+
+function _openEditModal(change) {
+  _editChangeType = change.change_type;
+
+  // Hide both forms, show the right one
+  document.getElementById('edit-form-update').classList.add('hidden');
+  document.getElementById('edit-form-create').classList.add('hidden');
+  document.getElementById('edit-error').textContent = '';
+
+  if (change.change_type === 'UPDATE' && change.story_update) {
+    const u = change.story_update;
+    document.getElementById('edit-title').value     = u.updated_title     || '';
+    document.getElementById('edit-story').value     = u.updated_story     || '';
+    document.getElementById('edit-changelog').value = u.changelog_entry   || '';
+    _setSelect('edit-priority', u.updated_priority || 'Medium');
+    _setSelect('edit-category', u.updated_category || 'Feature');
+    _buildAcRows('edit-ac-list', u.updated_acceptance_criteria);
+    document.getElementById('edit-form-update').classList.remove('hidden');
+
+  } else if (change.change_type === 'CREATE' && change.new_story) {
+    const n = change.new_story;
+    document.getElementById('edit-new-title').value = n.title    || '';
+    document.getElementById('edit-new-story').value = n.story    || '';
+    _setSelect('edit-new-priority', n.priority || 'Medium');
+    _setSelect('edit-new-category', n.category || 'Feature');
+    _buildAcRows('edit-new-ac-list', n.acceptance_criteria);
+    document.getElementById('edit-form-create').classList.remove('hidden');
+
+  } else {
+    document.getElementById('edit-error').textContent = 'This change has no editable fields.';
+  }
+
   document.getElementById('edit-modal').classList.remove('hidden');
 }
+
 function closeEditModal() {
   document.getElementById('edit-modal').classList.add('hidden');
 }
+
+function _collectAcRows(containerId) {
+  return Array.from(
+    document.querySelectorAll(`#${containerId} .edit-ac-input`)
+  ).map(el => el.value.trim()).filter(Boolean);
+}
+
 async function submitEdit() {
-  const raw   = document.getElementById('edit-json-input').value.trim();
   const errEl = document.getElementById('edit-error');
   errEl.textContent = '';
 
   let edited = {};
-  if (raw) {
-    try { edited = JSON.parse(raw); }
-    catch { errEl.textContent = 'Invalid JSON — please fix and retry.'; return; }
-  }
-  closeEditModal();
 
+  if (_editChangeType === 'UPDATE') {
+    edited = {
+      updated_title:               document.getElementById('edit-title').value.trim(),
+      updated_story:               document.getElementById('edit-story').value.trim(),
+      updated_priority:            document.getElementById('edit-priority').value,
+      updated_category:            document.getElementById('edit-category').value,
+      updated_acceptance_criteria: _collectAcRows('edit-ac-list'),
+      changelog_entry:             document.getElementById('edit-changelog').value.trim(),
+    };
+  } else if (_editChangeType === 'CREATE') {
+    edited = {
+      title:               document.getElementById('edit-new-title').value.trim(),
+      story:               document.getElementById('edit-new-story').value.trim(),
+      priority:            document.getElementById('edit-new-priority').value,
+      category:            document.getElementById('edit-new-category').value,
+      acceptance_criteria: _collectAcRows('edit-new-ac-list'),
+    };
+  }
+
+  closeEditModal();
   showLoading('Applying edits…');
+
   try {
     const r = await apiFetch(`/sessions/${currentConvId}/review`, {
       method: 'POST',

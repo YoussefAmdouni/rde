@@ -10,6 +10,7 @@ Routes:
   POST /api/sessions/:id/process/stream — run pipeline, stream progress
   POST /api/sessions/:id/review    — submit A/R/E decision for one proposed change
   GET  /api/sessions/:id/backlog   — download current/final backlog JSON
+  GET  /api/sessions/:id/proposed  — get proposed changes list (for edit modal)
   Auth: /api/auth/...
 """
 
@@ -271,11 +272,6 @@ async def upload_meeting_notes(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_active_user),
 ):
-    """
-    Accept user input (file or text), run Guard → Router, then:
-      MEETING_NOTES    → save + mark as 'uploaded' for pipeline
-      GENERAL_QUESTION → save as general_query for web-search SSE
-    """
     await _get_conv_or_404(conv_id, current_user.id, db)
     bs = await _get_or_create_backlog_session(conv_id, db)
 
@@ -312,7 +308,6 @@ async def upload_meeting_notes(
     logger.info(f"[{current_user.email}][{conv_id}] Route: {route}")
 
     if route == "MEETING_NOTES":
-        # ── Standard pipeline path ──
         bs.pipeline_stage   = "uploaded"
         bs.proposed_changes = None
         bs.review_index     = "0"
@@ -348,7 +343,6 @@ async def upload_meeting_notes(
         return {"status": "ok", "route": route}
 
 
-
 # ─── Stream general question (web-search agent) ───────────────────────────────
 @app.post("/api/sessions/{conv_id}/general/stream")
 @limiter.limit("10/minute")
@@ -358,10 +352,6 @@ async def general_stream(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_active_user),
 ):
-    """
-    SSE endpoint for GENERAL_QUESTION route.
-    Runs the Tavily ReAct agent and streams the answer back.
-    """
     await _get_conv_or_404(conv_id, current_user.id, db)
 
     bs_result = await db.execute(
@@ -374,7 +364,6 @@ async def general_stream(
             detail="No general question pending for this session"
         )
 
-    # Retrieve the question from the hidden system message
     msg_result = await db.execute(
         select(Message).where(
             Message.conversation_id == conv_id,
@@ -387,7 +376,6 @@ async def general_stream(
 
     question = query_msg.content
 
-    # Fetch prior visible messages for conversation memory (exclude system messages)
     history_result = await db.execute(
         select(Message).where(
             Message.conversation_id == conv_id,
@@ -398,7 +386,7 @@ async def general_stream(
     history = [
         {"role": m.role, "content": m.content}
         for m in history_result.scalars().all()
-        if m.content != question   # exclude the current question itself
+        if m.content != question
     ]
 
     async def event_gen() -> AsyncIterator[str]:
@@ -407,7 +395,6 @@ async def general_stream(
 
         async for chunk in stream_web_search_answer(question, conversation_history=history):
             yield chunk
-            # Parse emitted events to capture final answer for DB storage
             try:
                 data = json.loads(chunk.removeprefix("data: ").strip())
                 if data.get("type") == "answer":
@@ -417,7 +404,6 @@ async def general_stream(
             except Exception:
                 pass
 
-        # Persist assistant answer and reset session stage
         final_answer = "\n".join(answer_parts) if answer_parts else ""
         if final_answer:
             await _save_message(conv_id, "assistant", final_answer, msg_type="text")
@@ -448,11 +434,6 @@ async def process_stream(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_active_user),
 ):
-    """
-    SSE endpoint. Runs pipeline steps 1–3, streams progress to client.
-    Pauses at step 4 (human review), handled via POST /review.
-    Backlog data comes entirely from Pinecone — no local JSON needed.
-    """
     await _get_conv_or_404(conv_id, current_user.id, db)
 
     bs_result = await db.execute(
@@ -462,7 +443,6 @@ async def process_stream(
     if not bs or bs.pipeline_stage not in ("uploaded",):
         raise HTTPException(status_code=400, detail="No meeting notes uploaded yet, or pipeline already ran")
 
-    # Retrieve meeting notes from hidden system message
     msg_result = await db.execute(
         select(Message).where(
             Message.conversation_id == conv_id,
@@ -479,7 +459,6 @@ async def process_stream(
         run_id = make_run_id()
         state  = AgentState(meeting_notes=meeting_notes, run_id=run_id)
 
-        # Persist run_id immediately so /review can find it later
         async with AsyncSessionLocal() as s0:
             bs0 = await s0.get(BacklogSession, bs.id)
             if bs0:
@@ -526,7 +505,7 @@ async def process_stream(
                 yield _sse({"type": "step_done", "step": 3,
                             "message": f"✅ **{len(state.proposed_changes)} proposed change(s)** ready for your review."})
 
-            # ── Persist to DB (outside the trace context — I/O only) ──
+            # ── Persist to DB ──
             proposed_json = [c.model_dump() for c in state.proposed_changes]
 
             async with AsyncSessionLocal() as save_db:
@@ -555,7 +534,8 @@ async def process_stream(
                 return
 
             first_card = format_proposed_change_for_chat(0, proposed_json[0]).replace("{total}", str(total))
-            yield _sse({"type": "review_card", "index": 0, "total": total, "content": first_card})
+            
+            yield _sse({"type": "review_card", "index": 0, "total": total, "content": first_card, "change_data": proposed_json[0]})
             await _save_message(conv_id, "assistant", first_card, msg_type="review")
 
         except asyncio.CancelledError:
@@ -574,7 +554,7 @@ async def process_stream(
 # ─── Review decision endpoint ─────────────────────────────────────────────────
 
 class ReviewDecisionBody(BaseModel):
-    decision:    str            # APPROVE | REJECT | EDIT
+    decision:    str
     edited_data: Optional[dict] = None
 
 
@@ -607,8 +587,6 @@ async def submit_review(
     if current_idx >= total:
         raise HTTPException(status_code=400, detail="All changes already reviewed")
 
-    # Build decisions list (accumulated as JSON in DB)
-    # We retrieve existing decisions from a dedicated system message
     decisions_msg_result = await db.execute(
         select(Message).where(
             Message.conversation_id == conv_id,
@@ -632,12 +610,10 @@ async def submit_review(
     next_idx = current_idx + 1
 
     if next_idx < total:
-        # Save decisions + advance index
         async with AsyncSessionLocal() as s2:
             bs2 = await s2.get(BacklogSession, bs.id)
             bs2.review_index = str(next_idx)
             bs2.updated_at   = datetime.now(timezone.utc)
-            # Upsert decisions message
             dm = decisions_msg
             if dm:
                 dm2 = await s2.get(Message, dm.id)
@@ -655,14 +631,14 @@ async def submit_review(
         )
         await _save_message(conv_id, "assistant", card, msg_type="review")
         return {
-            "status": "next",
-            "next_index": next_idx,
-            "total": total,
+            "status":      "next",
+            "next_index":  next_idx,
+            "total":       total,
             "review_card": card,
+            "change_data": proposed[next_idx],
         }
 
     else:
-        # All reviewed — fetch the Pinecone snapshot we saved during pipeline, merge changes
         snapshot_result = await db.execute(
             select(Message).where(
                 Message.conversation_id == conv_id,
@@ -676,9 +652,6 @@ async def submit_review(
         approved = sum(1 for d in decisions if d["decision"] != "REJECT")
         rejected = sum(1 for d in decisions if d["decision"] == "REJECT")
 
-        # ── Upsert approved changes back to Pinecone ──────────────────────────
-        # Collect only the stories that were actually changed (UPDATE or CREATE,
-        # not REJECT or NO_CHANGE) so we don't re-embed the entire backlog.
         stories_to_upsert = []
         for dec in decisions:
             if dec["decision"] == "REJECT":
@@ -689,7 +662,6 @@ async def submit_review(
             if change["change_type"] == "UPDATE" and change.get("story_update"):
                 u = {**change["story_update"], **edits}
                 story_id = u["story_id"]
-                # Find the fully-merged story from final_backlog (has all fields)
                 merged = next((s for s in final_backlog if s["id"] == story_id), None)
                 if merged:
                     stories_to_upsert.append(merged)
@@ -711,7 +683,6 @@ async def submit_review(
                 f"[{conv_id}] Pinecone sync: {pinecone_synced} upserted, "
                 f"{len(pinecone_errors)} errors"
             )
-        # ──────────────────────────────────────────────────────────────────────
 
         async with AsyncSessionLocal() as s2:
             bs2 = await s2.get(BacklogSession, bs.id)
@@ -732,11 +703,9 @@ async def submit_review(
                 ))
             await s2.commit()
 
-        # ── Fetch LangSmith telemetry ─────────────────────────────────────────
         telemetry = None
         run_id    = bs.langsmith_run_id
         if run_id and _LANGSMITH_ENABLED:
-            # Give LangSmith 2 s to ingest the run before querying
             await asyncio.sleep(2)
             telemetry = await fetch_trace_telemetry(run_id)
             if telemetry:
@@ -746,9 +715,7 @@ async def submit_review(
                     f"{telemetry['latency_ms']}ms, "
                     f"{len(telemetry['llm_calls'])} LLM calls"
                 )
-        # ──────────────────────────────────────────────────────────────────────
 
-        # Build a readable changelog summary
         cl_lines = []
         for entry in changelog:
             action = entry["action"]
@@ -793,8 +760,28 @@ async def submit_review(
             "rejected":      rejected,
             "total_stories": len(final_backlog),
             "summary":       summary,
-            "telemetry":     telemetry,   # None if LangSmith not enabled
+            "telemetry":     telemetry,
         }
+
+
+# ─── Get proposed changes (for edit modal fallback) ────────────────────────────
+@app.get("/api/sessions/{conv_id}/proposed")
+@limiter.limit("30/minute")
+async def get_proposed_changes(
+    request: Request,
+    conv_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_active_user),
+):
+    """Return the proposed changes list for the current review session."""
+    await _get_conv_or_404(conv_id, current_user.id, db)
+    bs_result = await db.execute(
+        select(BacklogSession).where(BacklogSession.conversation_id == conv_id)
+    )
+    bs = bs_result.scalar_one_or_none()
+    if not bs or not bs.proposed_changes:
+        raise HTTPException(status_code=404, detail="No proposed changes found")
+    return {"changes": bs.proposed_changes, "review_index": int(bs.review_index or "0")}
 
 
 # ─── Download final backlog ────────────────────────────────────────────────────
@@ -805,7 +792,6 @@ async def download_backlog(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_active_user),
 ):
-    """Download the final updated backlog JSON (only available after review is complete)."""
     await _get_conv_or_404(conv_id, current_user.id, db)
     bs_result = await db.execute(
         select(BacklogSession).where(BacklogSession.conversation_id == conv_id)
@@ -828,7 +814,6 @@ async def download_changelog(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_active_user),
 ):
-    """Download just the changelog (list of applied/rejected changes)."""
     await _get_conv_or_404(conv_id, current_user.id, db)
     bs_result = await db.execute(
         select(BacklogSession).where(BacklogSession.conversation_id == conv_id)
@@ -843,7 +828,7 @@ async def download_changelog(
     )
 
 
-# ─── LangSmith telemetry (on-demand re-fetch) ────────────────────────────────
+# ─── LangSmith telemetry ──────────────────────────────────────────────────────
 @app.get("/api/sessions/{conv_id}/telemetry")
 @limiter.limit("20/minute")
 async def get_telemetry(
@@ -851,10 +836,6 @@ async def get_telemetry(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_active_user),
 ):
-    """
-    Fetch (or re-fetch) LangSmith telemetry for this session's pipeline run.
-    Returns 404 if LangSmith is not enabled or no run_id was recorded.
-    """
     await _get_conv_or_404(conv_id, current_user.id, db)
 
     if not _LANGSMITH_ENABLED:
@@ -874,6 +855,7 @@ async def get_telemetry(
     return telemetry
 
 
+# ─── Session status ───────────────────────────────────────────────────────────
 @app.get("/api/sessions/{conv_id}/status")
 async def session_status(
     conv_id: str,
