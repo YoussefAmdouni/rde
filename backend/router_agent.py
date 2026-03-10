@@ -1,21 +1,24 @@
 """
 Input Router
 ============
-Single fast LLM call that classifies user input into one of three intents:
+Classifies user input into one of two intents:
 
   MEETING_NOTES    → run the full backlog pipeline
-  BACKLOG_QUERY    → (future) Pinecone Q&A  — currently treated as GENERAL_QUESTION
   GENERAL_QUESTION → hand off to the Tavily web-search agent
 
-Only the first ~600 chars of the input are sent to keep latency and cost minimal.
+Classification order:
+  1. Keyword pre-check (regex, zero LLM cost) — catches obvious meeting notes
+  2. LLM classifier with Pydantic structured output — for ambiguous freeform text
 """
 
 import os
+import re
 import yaml
 from typing import Literal
 
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage
+from pydantic import BaseModel, Field
 
 from logger import get_logger
 logger = get_logger(__name__)
@@ -27,43 +30,90 @@ with open(_PROMPTS_FILE, "r", encoding="utf-8") as _f:
 
 PROMPT_ROUTER = _PROMPTS["input_router"]
 
-# ─── LLM (same model, label-only output) ─────────────────────────────────────
+# ─── Pydantic output schema ───────────────────────────────────────────────────
+RouteLabel = Literal["MEETING_NOTES", "GENERAL_QUESTION"]
+
+class RouteResult(BaseModel):
+    route: RouteLabel = Field(
+        description=(
+            "MEETING_NOTES if the input is meeting notes, a transcript, agenda, "
+            "or any text describing what was discussed or decided in a meeting. "
+            "GENERAL_QUESTION for everything else — greetings, questions, advice, etc."
+        )
+    )
+    reasoning: str = Field(
+        description="One sentence explaining why this route was chosen."
+    )
+
+# ─── LLM with structured output ──────────────────────────────────────────────
 _llm_router = ChatGoogleGenerativeAI(
     model="gemini-2.5-flash",
     temperature=0.0,
-    max_output_tokens=10,
+).with_structured_output(RouteResult).with_retry(stop_after_attempt=3)
+
+
+# ─── Keyword pre-check ────────────────────────────────────────────────────────
+# Matches strong structural signals that appear in meeting notes, transcripts,
+# agendas, and minutes — but almost never in conversational questions.
+# If any signal is found in the first 500 chars we skip the LLM entirely.
+_MEETING_SIGNALS = re.compile(
+    r"\b("
+    r"attendees?"
+    r"|agenda"
+    r"|action\s+items?"
+    r"|meeting\s+(notes?|minutes?|title|summary)"
+    r"|scrum|standup|stand-up"
+    r"|sprint\s+(review|planning|retrospective|refinement|goal)"
+    r"|retrospective"
+    r"|transcri(pt|ption)"
+    r"|host[:\s]"
+    r"|joined\s+at"
+    r"|recorded\s+by"
+    r"|note[- ]?taker"
+    r"|next\s+meeting"
+    r"|decisions?\s+made"
+    r"|discussion\s+points?"
+    r"|follow[- ]?ups?"
+    r"|\d{1,2}:\d{2}\s*(am|pm|AM|PM)"
+    r")",
+    re.IGNORECASE,
 )
 
-RouteLabel = Literal["MEETING_NOTES", "GENERAL_QUESTION"]
 
-_VALID_LABELS: set[RouteLabel] = {"MEETING_NOTES", "GENERAL_QUESTION"}
+def _keyword_precheck(text: str) -> RouteLabel | None:
+    """
+    Returns MEETING_NOTES if strong structural signals are found in the first
+    500 characters, otherwise None (fall through to LLM classifier).
+    """
+    if _MEETING_SIGNALS.search(text[:500]):
+        logger.info("[Router] Keyword pre-check matched — MEETING_NOTES (skipped LLM)")
+        return "MEETING_NOTES"
+    return None
 
 
 async def classify_input(text: str) -> RouteLabel:
     """
     Classify user input into a routing label.
-    Falls back to GENERAL_QUESTION on any error to avoid blocking the user.
+
+    Order:
+      1. Keyword pre-check — instant, zero cost, handles clear meeting notes
+      2. LLM classifier    — Pydantic structured output, only for ambiguous text
+
+    Falls back to GENERAL_QUESTION on any LLM error to avoid blocking the user.
     """
+    # ── Layer 1: keyword pre-check ──
+    precheck = _keyword_precheck(text)
+    if precheck is not None:
+        return precheck
+
+    # ── Layer 2: LLM classifier with structured output ──
     snippet = text[:600]
     prompt  = PROMPT_ROUTER.format(user_input=snippet)
 
     try:
-        response    = await _llm_router.ainvoke([HumanMessage(content=prompt)])
-        label_raw = response.content.strip().upper().split()[0]
-
-        # Normalise partial matches the LLM sometimes returns
-        if label_raw in ("MEETING", "MEETING_NOTE", "NOTES"):
-            label_raw = "MEETING_NOTES"
-        elif label_raw.startswith("GENERAL") or label_raw in ("QUESTION", "GENERAL_Q"):
-            label_raw = "GENERAL_QUESTION"
-
-        if label_raw not in _VALID_LABELS:
-            logger.warning(f"[Router] Unknown label '{label_raw}' — defaulting to GENERAL_QUESTION")
-            return "GENERAL_QUESTION"
-
-        label: RouteLabel = label_raw  # type: ignore[assignment]
-        logger.info(f"[Router] Classified as: {label}")
-        return label
+        result: RouteResult = await _llm_router.ainvoke([HumanMessage(content=prompt)])
+        logger.info(f"[Router] LLM classified as: {result.route} — {result.reasoning}")
+        return result.route
 
     except Exception as e:
         logger.error(f"[Router] Classification error — defaulting to GENERAL_QUESTION: {e}")
