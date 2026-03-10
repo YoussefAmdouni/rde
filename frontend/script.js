@@ -205,9 +205,6 @@ function renderSidebar(convs) {
 }
 
 async function switchConversation(id) {
-  if (id === currentConvId && appInited) {
-    // still reload messages to refresh state
-  }
   currentConvId = id;
   document.getElementById('chat-box').innerHTML = '';
   await loadMessages(id);
@@ -222,7 +219,8 @@ async function loadMessages(id) {
 
   let hasResult = false;
   (data.messages || []).forEach(m => {
-    if (m.msg_type === 'meeting_notes' || m.msg_type === 'review_decisions') return; // hidden system messages
+    // Skip hidden system messages
+    if (m.msg_type === 'meeting_notes' || m.msg_type === 'review_decisions' || m.msg_type === 'general_query' || m.msg_type === 'pinecone_snapshot') return;
     appendMessage(m.content, m.role, m.msg_type, false);
     if (m.msg_type === 'result') hasResult = true;
   });
@@ -306,16 +304,22 @@ async function runPipeline() {
 
   // Capture input before resetting the composer
   const userText = textArea;
+  const userFileName = notesFile ? notesFile.name : null;
 
   const form = new FormData();
   if (notesFile) form.append('meeting_notes_file', notesFile);
   if (textArea)  form.append('meeting_notes_text', textArea);
 
-  // Show user message immediately — don't wait for the API
-  if (userText) appendMessage(userText, 'user', 'text', true);
+  // ── Show user message immediately — don't wait for the API ──
+  if (userFileName) {
+    appendMessage(`📎 **${userFileName}**`, 'user', 'text', true);
+  } else if (userText) {
+    appendMessage(userText, 'user', 'text', true);
+  }
 
   // Reset composer
   document.getElementById('notes-textarea').value = '';
+  autoResizeComposer(document.getElementById('notes-textarea'));
   removeAttachment();
   showPanel('processing');
   document.getElementById('processing-label').textContent = 'Analysing input…';
@@ -340,10 +344,10 @@ async function runPipeline() {
 
     if (route === 'MEETING_NOTES') {
       const chars = uploadData.chars ? uploadData.chars.toLocaleString() : '?';
-      appendMessage(`📄 **Meeting notes loaded** · ${chars} chars`, 'assistant', 'text', false);
+      appendMessage(`📄 **Meeting notes loaded** · ${chars} chars`, 'assistant', 'text', true);
       await streamPipeline();
     } else {
-      // GENERAL_QUESTION — message already shown above, just run web search
+      // GENERAL_QUESTION — user message already shown above
       await streamGeneralAnswer();
     }
 
@@ -424,7 +428,9 @@ async function streamGeneralAnswer() {
   }
 }
 
-
+// ─── SSE event handler ────────────────────────────────────────────────────────
+// FIX: was a bare block before — must be a named function for streamPipeline/streamGeneralAnswer to call it
+function handleSSEEvent(ev) {
   const box = document.getElementById('chat-box');
 
   if (ev.type === 'step') {
@@ -475,6 +481,7 @@ async function streamGeneralAnswer() {
     appendMessage(`❌ ${ev.message}`, 'assistant', 'text', true);
     showPanel('upload');
   }
+}
 
 
 // ─── Review ───────────────────────────────────────────────────────────────────
