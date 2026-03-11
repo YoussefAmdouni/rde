@@ -3,6 +3,9 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
+*.txt
+*.pdf
+*.json
 
 # Database files
 *.db
