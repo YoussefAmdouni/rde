@@ -241,7 +241,7 @@ async def fetch_trace_telemetry(run_id: str) -> dict | None:
                     "parent_run": run_id,
                     "run_type":   "llm",
                     "limit":      50,
-                    "select":     "name,start_time,end_time,total_tokens,prompt_tokens,completion_tokens,inputs,outputs,status",
+                    #"select":     "name,start_time,end_time,total_tokens,prompt_tokens,completion_tokens,inputs,outputs,status",
                 },
                 headers=headers,
             )
