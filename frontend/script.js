@@ -433,7 +433,7 @@ let _currentReviewData = null;
 
 // ─── SSE event handler ────────────────────────────────────────────────────────
 // FIX: was a bare block before — must be a named function for streamPipeline/streamGeneralAnswer to call it
-function handleSSEEvent(ev) {
+async function handleSSEEvent(ev) {
   const box = document.getElementById('chat-box');
 
   if (ev.type === 'step') {
@@ -474,9 +474,14 @@ function handleSSEEvent(ev) {
     showPanel('review');
   }
   else if (ev.type === 'answer') {
-    // Final web-search answer — render as a nicely styled assistant message
     appendMessage(ev.message, 'assistant', 'text', true);
-    showPanel('upload');   // ready for next question
+    // If pipeline is done, stay in done panel (chat bar visible)
+    // otherwise go back to upload
+    const sr = await fetch(`${API}/sessions/${currentConvId}/status`, {
+      headers: { 'Authorization': `Bearer ${getToken()}` }
+    });
+    const { stage } = await sr.json();
+    showPanel(stage === 'done' ? 'done' : 'upload');
   }
   else if (ev.type === 'done') {
     appendMessage(ev.message, 'assistant', 'result', true);
@@ -695,19 +700,47 @@ async function submitEdit() {
 }
 
 // ─── Post-pipeline chat input ─────────────────────────────────────────────────
-function sendChat() {
+async function sendChat() {
   const input = document.getElementById('user-input');
   const text  = input.value.trim();
   if (!text) return;
   input.value = '';
+
+  // Reuse the full upload → classify → stream flow
+  // so the router can direct it to web-search or pipeline as needed
+  const form = new FormData();
+  form.append('meeting_notes_text', text);
+
   appendMessage(text, 'user', 'text', true);
-  // Friendly acknowledgement — full Q&A could be added here via a /chat endpoint
-  setTimeout(() => {
-    appendMessage(
-      '💡 The backlog has been updated. You can start a **New Session** to process more meeting notes, or **Download Backlog** to export the result.',
-      'assistant', 'text', true
-    );
-  }, 300);
+  showPanel('processing');
+  document.getElementById('processing-label').textContent = 'Thinking…';
+
+  try {
+    const ur = await fetch(`${API}/sessions/${currentConvId}/upload`, {
+      method:  'POST',
+      headers: { 'Authorization': `Bearer ${getToken()}` },
+      body:    form,
+    });
+
+    if (!ur.ok) {
+      const d = await ur.json().catch(() => ({}));
+      appendMessage(`❌ ${d.detail || 'Request failed'}`, 'assistant', 'text', true);
+      showPanel('done');
+      return;
+    }
+
+    const { route } = await ur.json();
+
+    if (route === 'MEETING_NOTES') {
+      await streamPipeline();
+    } else {
+      await streamGeneralAnswer();
+    }
+
+  } catch (e) {
+    appendMessage(`❌ ${e.message}`, 'assistant', 'text', true);
+    showPanel('done');
+  }
 }
 
 // ─── Download backlog ─────────────────────────────────────────────────────────
