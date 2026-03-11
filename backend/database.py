@@ -1,11 +1,5 @@
 """
 Database setup — PostgreSQL via asyncpg (Neon-compatible).
-
-Connection string format for Neon:
-  postgresql+asyncpg://user:password@host/dbname?ssl=require
-
-Set DATABASE_URL in your .env file:
-  DATABASE_URL=postgresql+asyncpg://neondb_owner:<password>@<host>.neon.tech/neondb?ssl=require
 """
 import os
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
