@@ -57,7 +57,8 @@ from router_agent import classify_input
 from web_search_agent import stream_web_search_answer
 from auth import auth_router, require_active_user, SECRET_KEY
 from database import (
-    create_tables, get_db, AsyncSessionLocal,
+    create_tables, check_db_connection, get_db, AsyncSessionLocal,
+    DATABASE_URL, _IS_POSTGRES,
     User, Conversation, Message, BacklogSession,
 )
 from logger import get_logger
@@ -81,8 +82,21 @@ limiter = Limiter(key_func=get_user_or_ip)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Log which database we're using
+    db_type = "PostgreSQL (Neon)" if _IS_POSTGRES else "SQLite (local)"
+    logger.info(f"Database backend: {db_type}")
+
+    # Create tables
     await create_tables()
     logger.info("Database tables ready")
+
+    # Verify connectivity
+    ok = await check_db_connection()
+    if ok:
+        logger.info(f"Database connection verified ✓")
+    else:
+        logger.error(f"Database connection FAILED — check DATABASE_URL")
+
     yield
 
 
@@ -164,7 +178,13 @@ def _extract_text_from_pdf(content: bytes) -> str:
 # ─── Health ────────────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
-    return {"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()}
+    db_ok = await check_db_connection()
+    return {
+        "status":    "ok" if db_ok else "degraded",
+        "database":  "postgres" if _IS_POSTGRES else "sqlite",
+        "db_online": db_ok,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 # ─── Conversations (sessions) ──────────────────────────────────────────────────
@@ -276,13 +296,13 @@ async def upload_meeting_notes(
     bs = await _get_or_create_backlog_session(conv_id, db)
 
     # ── Parse raw text ──
-    raw_text   = ""
+    raw_text     = ""
     source_label = ""
     if meeting_notes_file and meeting_notes_file.filename:
-        content = await meeting_notes_file.read()
-        fname   = meeting_notes_file.filename.lower()
-        raw_text     = _extract_text_from_pdf(content) if fname.endswith(".pdf") \
-                       else content.decode("utf-8", errors="replace")
+        content  = await meeting_notes_file.read()
+        fname    = meeting_notes_file.filename.lower()
+        raw_text = (_extract_text_from_pdf(content) if fname.endswith(".pdf")
+                    else content.decode("utf-8", errors="replace"))
         source_label = meeting_notes_file.filename
     elif meeting_notes_text:
         raw_text     = meeting_notes_text.strip()
@@ -291,19 +311,16 @@ async def upload_meeting_notes(
     if not raw_text:
         raise HTTPException(status_code=400, detail="No input provided")
 
-    # ── Layer 1 + 2: Guard ──
+    # ── Guard ──
     guard_result = await check_input(raw_text)
     if not guard_result.safe:
         logger.warning(
             f"[{current_user.email}][{conv_id}] Guard blocked "
             f"(layer {guard_result.layer}): {guard_result.description[:100]}"
         )
-        raise HTTPException(
-            status_code=400,
-            detail=f"⛔ {guard_result.description}"
-        )
+        raise HTTPException(status_code=400, detail=f"⛔ {guard_result.description}")
 
-    # ── Router: classify intent ──
+    # ── Router ──
     route = await classify_input(raw_text)
     logger.info(f"[{current_user.email}][{conv_id}] Route: {route}")
 
@@ -316,7 +333,6 @@ async def upload_meeting_notes(
         bs.updated_at       = datetime.now(timezone.utc)
         await db.commit()
 
-        preview = raw_text[:300] + ("…" if len(raw_text) > 300 else "")
         await _save_message(
             conv_id, "user",
             f"📄 **Meeting notes loaded** from *{source_label}* · {len(raw_text):,} chars",
@@ -331,7 +347,6 @@ async def upload_meeting_notes(
         return {"status": "ok", "route": "MEETING_NOTES", "chars": len(raw_text)}
 
     else:
-        # GENERAL_QUESTION → web-search agent
         bs.pipeline_stage = "general_query"
         bs.updated_at     = datetime.now(timezone.utc)
         await db.commit()
@@ -343,7 +358,7 @@ async def upload_meeting_notes(
         return {"status": "ok", "route": route}
 
 
-# ─── Stream general question (web-search agent) ───────────────────────────────
+# ─── Stream general question ──────────────────────────────────────────────────
 @app.post("/api/sessions/{conv_id}/general/stream")
 @limiter.limit("10/minute")
 async def general_stream(
@@ -359,10 +374,7 @@ async def general_stream(
     )
     bs = bs_result.scalar_one_or_none()
     if not bs or bs.pipeline_stage != "general_query":
-        raise HTTPException(
-            status_code=400,
-            detail="No general question pending for this session"
-        )
+        raise HTTPException(status_code=400, detail="No general question pending for this session")
 
     msg_result = await db.execute(
         select(Message).where(
@@ -421,8 +433,7 @@ async def general_stream(
         )
 
     return StreamingResponse(event_gen(), media_type="text/event-stream",
-                             headers={"Cache-Control": "no-cache",
-                                      "X-Accel-Buffering": "no"})
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 # ─── Stream pipeline processing ───────────────────────────────────────────────
@@ -484,8 +495,8 @@ async def process_stream(
                 yield _sse({"type": "step", "step": 2, "message": "🔎 Searching Pinecone backlog for matching stories…"})
                 pinecone_stories = []
                 try:
-                    vector_store    = load_vector_store()
-                    state           = await step_search_match(state, vector_store, parent_run_id)
+                    vector_store     = load_vector_store()
+                    state            = await step_search_match(state, vector_store, parent_run_id)
                     pinecone_stories = await asyncio.to_thread(fetch_all_stories_from_pinecone)
                     yield _sse({"type": "step_done", "step": 2,
                                 "message": f"✅ Backlog search complete — **{len(pinecone_stories)} stories** found in Pinecone."})
@@ -534,8 +545,8 @@ async def process_stream(
                 return
 
             first_card = format_proposed_change_for_chat(0, proposed_json[0]).replace("{total}", str(total))
-            
-            yield _sse({"type": "review_card", "index": 0, "total": total, "content": first_card, "change_data": proposed_json[0]})
+            yield _sse({"type": "review_card", "index": 0, "total": total,
+                        "content": first_card, "change_data": proposed_json[0]})
             await _save_message(conv_id, "assistant", first_card, msg_type="review")
 
         except asyncio.CancelledError:
@@ -580,9 +591,9 @@ async def submit_review(
     if decision not in ("APPROVE", "REJECT", "EDIT"):
         raise HTTPException(status_code=400, detail="Decision must be APPROVE, REJECT, or EDIT")
 
-    current_idx  = int(bs.review_index or "0")
-    proposed     = bs.proposed_changes or []
-    total        = len(proposed)
+    current_idx = int(bs.review_index or "0")
+    proposed    = bs.proposed_changes or []
+    total       = len(proposed)
 
     if current_idx >= total:
         raise HTTPException(status_code=400, detail="All changes already reviewed")
@@ -602,8 +613,8 @@ async def submit_review(
         "edited_data":  body.edited_data,
     })
 
-    change  = proposed[current_idx]
-    label   = {"APPROVE": "✅ Approved", "REJECT": "❌ Rejected", "EDIT": "✏️ Edited"}[decision]
+    change   = proposed[current_idx]
+    label    = {"APPROVE": "✅ Approved", "REJECT": "❌ Rejected", "EDIT": "✏️ Edited"}[decision]
     user_msg = f"{label}: **{change['topic_title']}** ({change['change_type']})"
     await _save_message(conv_id, "user", user_msg, msg_type="review_decision")
 
@@ -645,7 +656,7 @@ async def submit_review(
                 Message.msg_type == "pinecone_snapshot",
             ).order_by(Message.created_at.desc()).limit(1)
         )
-        snapshot_msg    = snapshot_result.scalar_one_or_none()
+        snapshot_msg     = snapshot_result.scalar_one_or_none()
         pinecone_stories = json.loads(snapshot_msg.content) if snapshot_msg else []
 
         final_backlog, changelog = apply_review_decisions(pinecone_stories, proposed, decisions)
@@ -660,16 +671,16 @@ async def submit_review(
             edits  = dec.get("edited_data") or {}
 
             if change["change_type"] == "UPDATE" and change.get("story_update"):
-                u = {**change["story_update"], **edits}
+                u        = {**change["story_update"], **edits}
                 story_id = u["story_id"]
-                merged = next((s for s in final_backlog if s["id"] == story_id), None)
+                merged   = next((s for s in final_backlog if s["id"] == story_id), None)
                 if merged:
                     stories_to_upsert.append(merged)
 
             elif change["change_type"] == "CREATE" and change.get("new_story"):
-                n = {**change["new_story"], **edits}
+                n        = {**change["new_story"], **edits}
                 story_id = n["suggested_id"]
-                merged = next((s for s in final_backlog if s["id"] == story_id), None)
+                merged   = next((s for s in final_backlog if s["id"] == story_id), None)
                 if merged:
                     stories_to_upsert.append(merged)
 
@@ -686,11 +697,11 @@ async def submit_review(
 
         async with AsyncSessionLocal() as s2:
             bs2 = await s2.get(BacklogSession, bs.id)
-            bs2.final_backlog   = final_backlog
-            bs2.changelog       = changelog
-            bs2.pipeline_stage  = "done"
-            bs2.review_index    = str(next_idx)
-            bs2.updated_at      = datetime.now(timezone.utc)
+            bs2.final_backlog  = final_backlog
+            bs2.changelog      = changelog
+            bs2.pipeline_stage = "done"
+            bs2.review_index   = str(next_idx)
+            bs2.updated_at     = datetime.now(timezone.utc)
             dm = decisions_msg
             if dm:
                 dm2 = await s2.get(Message, dm.id)
@@ -764,7 +775,7 @@ async def submit_review(
         }
 
 
-# ─── Get proposed changes (for edit modal fallback) ────────────────────────────
+# ─── Get proposed changes ──────────────────────────────────────────────────────
 @app.get("/api/sessions/{conv_id}/proposed")
 @limiter.limit("30/minute")
 async def get_proposed_changes(
@@ -773,7 +784,6 @@ async def get_proposed_changes(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_active_user),
 ):
-    """Return the proposed changes list for the current review session."""
     await _get_conv_or_404(conv_id, current_user.id, db)
     bs_result = await db.execute(
         select(BacklogSession).where(BacklogSession.conversation_id == conv_id)
