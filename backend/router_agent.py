@@ -10,7 +10,7 @@ Classification order:
   1. Keyword pre-check (regex, zero LLM cost) — catches obvious meeting notes
   2. LLM classifier with Pydantic structured output — for ambiguous freeform text
 """
-
+ 
 import os
 import re
 import yaml
@@ -19,6 +19,7 @@ from typing import Literal
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage
 from pydantic import BaseModel, Field
+from llm_config import get_llm
 
 from logger import get_logger
 logger = get_logger(__name__)
@@ -46,10 +47,7 @@ class RouteResult(BaseModel):
     )
 
 # ─── LLM with structured output ──────────────────────────────────────────────
-_llm_router = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash",
-    temperature=0.0,
-).with_structured_output(RouteResult).with_retry(stop_after_attempt=3)
+_llm_router = get_llm("ROUTER").with_structured_output(RouteResult).with_retry(stop_after_attempt=3)
 
 
 # ─── Keyword pre-check ────────────────────────────────────────────────────────

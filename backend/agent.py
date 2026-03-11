@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_core.messages import HumanMessage
 from langchain_pinecone import PineconeVectorStore
+from llm_config import get_llm, log_all_configs
 
 from dotenv import load_dotenv
 load_dotenv(".env")
@@ -112,12 +113,11 @@ class ProposedChange(BaseModel):
     reason:       str
 
 # ─── LLM clients ──────────────────────────────────────────────────────────────
-_base_llm = ChatGoogleGenerativeAI(model="gemini-3.1-flash-lite-preview", temperature=0.0)
 
-llm_extract = _base_llm.with_structured_output(ExtractionResult).with_retry(stop_after_attempt=3)
-llm_match   = _base_llm.with_structured_output(MatchDecision).with_retry(stop_after_attempt=3)
-llm_update  = _base_llm.with_structured_output(StoryUpdate).with_retry(stop_after_attempt=3)
-llm_new     = _base_llm.with_structured_output(NewStory).with_retry(stop_after_attempt=3)
+llm_extract = get_llm("EXTRACT").with_structured_output(ExtractionResult).with_retry(stop_after_attempt=3)
+llm_match   = get_llm("MATCH").with_structured_output(MatchDecision).with_retry(stop_after_attempt=3)
+llm_update  = get_llm("UPDATE").with_structured_output(StoryUpdate).with_retry(stop_after_attempt=3)
+llm_new     = get_llm("CREATE").with_structured_output(NewStory).with_retry(stop_after_attempt=3)
 
 # ─── LangSmith run context ────────────────────────────────────────────────────
 

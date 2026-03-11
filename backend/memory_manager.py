@@ -16,6 +16,7 @@ This keeps the context window lean without losing important earlier context.
 import os
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage
+from llm_config import get_llm
 
 from dotenv import load_dotenv
 load_dotenv(".env")
@@ -28,12 +29,7 @@ TOKEN_BUDGET    = int(os.getenv("HISTORY_TOKEN_BUDGET", "8000"))
 RECENT_TURNS    = int(os.getenv("HISTORY_RECENT_TURNS", "8"))     
 CHARS_PER_TOKEN = 4                                               
 
-# Light summariser — gemma-3-27b-it via Google AI
-_llm_summariser = ChatGoogleGenerativeAI(
-    model="gemma-3-27b-it",
-    temperature=0.0,
-).with_retry(stop_after_attempt=2)
-
+_llm_summariser = get_llm("SUMMARISER").with_retry(stop_after_attempt=2)
 
 def _estimate_tokens(messages: list[dict]) -> int:
     """Rough token estimate: total chars / 4."""

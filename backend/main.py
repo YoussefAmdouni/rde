@@ -63,6 +63,8 @@ from database import (
     DATABASE_URL, _IS_POSTGRES,
     User, Conversation, Message, BacklogSession,
 )
+from llm_config import log_all_configs
+
 from logger import get_logger
 
 logger = get_logger(__name__)
@@ -91,7 +93,7 @@ async def lifespan(app: FastAPI):
     # Create tables
     await create_tables()
     logger.info("Database tables ready")
-
+    log_all_configs(logger)
     # Verify connectivity
     ok = await check_db_connection()
     if ok:

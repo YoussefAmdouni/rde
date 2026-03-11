@@ -20,6 +20,8 @@ from pydantic import BaseModel, Field
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage
 
+from llm_config import get_llm
+
 from logger import get_logger
 logger = get_logger(__name__)
 
@@ -49,10 +51,7 @@ class GuardResult(BaseModel):
 
 
 # ─── LLM (structured output) ─────────────────────────────────────────────────
-_llm_guard = ChatGoogleGenerativeAI(
-    model="gemini-3.1-flash-lite-preview",
-    temperature=0.0,
-).with_structured_output(GuardResult).with_retry(stop_after_attempt=2)
+_llm_guard = get_llm("GUARD").with_structured_output(GuardResult).with_retry(stop_after_attempt=2)
 
 
 # ─── Layer 1: Regex / heuristic patterns ─────────────────────────────────────
@@ -87,7 +86,7 @@ _UNSAFE_PATTERNS: list[tuple[str, str]] = [
      "Prompt injection attempt: tries to override the AI system."),
     (r"bypass\s+(the\s+)?(?:filter|safety|guard|restriction)",
      "Unsafe input: attempts to bypass safety filters."),
-
+ 
     # Harmful content
     (r"\b(how\s+to\s+)?(make|build|create|synthesize)\s+(a\s+)?(bomb|weapon|explosive|poison|malware|virus|ransomware)",
      "Unsafe input: request for harmful or dangerous content."),
