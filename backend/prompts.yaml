@@ -78,9 +78,12 @@ update_story: |
   - Keep the same story ID.
   - Preserve acceptance criteria that are still valid.
   - Add or modify criteria as needed based on the meeting notes.
-  - If the meeting explicitly changed the priority, use the new one; otherwise
-    keep the original.
+  - If the meeting explicitly changed the priority, use the new one; otherwise keep the original.
   - Write a concise one-sentence changelog_entry: what changed and why.
+  - Make sure the user story title be in the format "As a/an << role >> I want << this goal >> so that << reason >>". Ensure that Title length should be within the range of 100 to 255 characters.
+  - Make sure the user story description be in the format "As a/an << role >> I want << this goal >> so that << reason >>". Ensure that Description length is within the range of 250 to 4500 characters. 
+  - Make sure the acceptance criteria is written in GHERKIN and including the different scenarios. 
+
 
   Context from prior decisions:
   {memory}
@@ -98,10 +101,10 @@ create_story: |
     Category hint:  {category_hint}
 
   Instructions:
-  - Suggest an appropriate story ID. The highest existing ID is {max_existing_id},
-    so your suggested ID must come after it.
-  - Write the story in "As a [persona], I want [goal] so that [benefit]" format.
-  - Write exactly 3 acceptance criteria in Given / When / Then format.
+  - Suggest an appropriate story ID. The highest existing ID is {max_existing_id}, so your suggested ID must come after it.
+  - Title: Title should be in the format. "As a/an << role >> I want << this goal >> so that << reason >>". Ensure that Title length should be within the range of 100 to 255 characters.
+  - Description: Description should be in format "As a/an << role >> I want << this goal >> so that << reason >>". Ensure that Description length is within the range of 250 to 4500 characters. 
+  - Acceptance Criteria: Ensure that the length of Acceptance criteria is within the range of 250 to 4500 characters. Should strictly be written in GHERKIN including the different scenarios. Include any tabular data, formulae, equations, values or examples to the functionality and present in the provided content. Do not add any extra content apart from the provided context.
   - Be specific — avoid vague language like "the system should work correctly".
 
   Context from prior decisions:
