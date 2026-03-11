@@ -1,17 +1,11 @@
 """
 Web Search Agent
 ================
-Answers GENERAL_QUESTION intents using a plain LLM + tool loop —
-same pattern as the existing agent.py in the project, no langchain.agents needed.
+Answers GENERAL_QUESTION intents using a plain LLM + tool loop 
+same pattern as the existing agent.py in the project.
 
 The LLM is bound to the Tavily search tool and loops until it stops
 making tool calls (= final answer reached) or hits max iterations.
-
-SSE event types emitted:
-  {"type": "step",      "step": N, "message": "..."}   — tool call in progress
-  {"type": "step_done", "step": N, "message": "..."}   — tool call complete
-  {"type": "answer",    "message": "..."}              — final answer
-  {"type": "error",     "message": "..."}              — something went wrong
 """
 
 import os
@@ -24,6 +18,7 @@ from typing import AsyncIterator
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_community.tools.tavily_search import TavilySearchResults
 from langchain_core.messages import HumanMessage
+from memory_manager import compress_history
 
 from logger import get_logger
 logger = get_logger(__name__)
@@ -75,10 +70,10 @@ async def stream_web_search_answer(
     # Build memory string from conversation history
     history = conversation_history or []
     if history:
+        compressed = await compress_history(history)
         memory = "\n".join(
             f"{m['role'].upper()}: {m['content']}"
-            for m in history[-10:]   # last 10 turns max
-        )
+            for m in compressed)
     else:
         memory = "No prior conversation."
 

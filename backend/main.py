@@ -38,6 +38,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from jose import jwt
 
+from memory_manager import compress_history
 from agent import (
     AgentState,
     load_vector_store,
@@ -422,13 +423,14 @@ async def general_stream(
             Message.conversation_id == conv_id,
             Message.role.in_(["user", "assistant"]),
             Message.msg_type.notin_(["meeting_notes", "general_query", "pinecone_snapshot"]),
-        ).order_by(Message.created_at.asc()).limit(20)
+        ).order_by(Message.created_at.asc()).limit(60)   # fetch more, compressor will trim
     )
-    history = [
+    raw_history = [
         {"role": m.role, "content": m.content}
         for m in history_result.scalars().all()
         if m.content != question
     ]
+    history = await compress_history(raw_history) 
 
     async def event_gen() -> AsyncIterator[str]:
         answer_parts: list[str] = []
