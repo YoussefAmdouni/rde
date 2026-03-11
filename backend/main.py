@@ -20,6 +20,7 @@ import json
 import uuid
 import asyncio
 import re
+import pypdf
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -163,16 +164,44 @@ async def _save_message(conv_id: str, role: str, content: str,
 def _sse(data: dict) -> str:
     return f"data: {json.dumps(data)}\n\n"
 
-
+    
 def _extract_text_from_pdf(content: bytes) -> str:
     """Extract plain text from PDF bytes using pypdf."""
     try:
-        import pypdf
         reader = pypdf.PdfReader(io.BytesIO(content))
-        return "\n".join(page.extract_text() or "" for page in reader.pages)
+        parts = []
+        for page in reader.pages:
+            try:
+                text = page.extract_text() or ""
+            except Exception as page_err:
+                logger.warning(f"Skipping page due to extraction error: {page_err}")
+                text = ""
+            # Strip lone surrogates that cause utf-16-be encode errors in pypdf
+            text = text.encode("utf-16", "surrogatepass").decode("utf-16", "ignore")
+            # Normalize to clean ASCII-safe unicode
+            text = text.encode("utf-8", "ignore").decode("utf-8", "ignore")
+            parts.append(text)
+
+        extracted = "\n".join(parts).strip()
+        if not extracted:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Could not extract text from this PDF. "
+                    "It may be scanned/image-based. "
+                    "Please copy-paste the text directly into the text box instead."
+                ),
+            )
+        return extracted
+
+    except HTTPException:
+        raise
     except Exception as e:
         logger.warning(f"PDF extraction failed: {e}")
-        return ""
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to read PDF: {e}. Try copy-pasting the text instead.",
+        )
 
 
 # ─── Health ────────────────────────────────────────────────────────────────────
