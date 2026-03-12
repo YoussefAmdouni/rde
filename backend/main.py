@@ -1,6 +1,12 @@
 """
 Smart Backlog Assistant — FastAPI Backend
 =========================================
+Every user input in a session goes through the same flow:
+  upload → guard → router → (pipeline stream | general stream) → result
+
+The pipeline can be run multiple times in the same session — each new
+submission of meeting notes resets the backlog state for that session.
+
 Routes:
   POST /api/conversations          — create session
   GET  /api/conversations          — list sessions
@@ -86,21 +92,16 @@ limiter = Limiter(key_func=get_user_or_ip)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Log which database we're using
     db_type = "PostgreSQL (Neon)" if _IS_POSTGRES else "SQLite (local)"
     logger.info(f"Database backend: {db_type}")
-
-    # Create tables
     await create_tables()
     logger.info("Database tables ready")
     log_all_configs(logger)
-    # Verify connectivity
     ok = await check_db_connection()
     if ok:
         logger.info(f"Database connection verified ✓")
     else:
         logger.error(f"Database connection FAILED — check DATABASE_URL")
-
     yield
 
 
@@ -167,7 +168,7 @@ async def _save_message(conv_id: str, role: str, content: str,
 def _sse(data: dict) -> str:
     return f"data: {json.dumps(data)}\n\n"
 
-    
+
 def _extract_text_from_pdf(content: bytes) -> str:
     """Extract plain text from PDF bytes using pypdf."""
     try:
@@ -179,9 +180,7 @@ def _extract_text_from_pdf(content: bytes) -> str:
             except Exception as page_err:
                 logger.warning(f"Skipping page due to extraction error: {page_err}")
                 text = ""
-            # Strip lone surrogates that cause utf-16-be encode errors in pypdf
             text = text.encode("utf-16", "surrogatepass").decode("utf-16", "ignore")
-            # Normalize to clean ASCII-safe unicode
             text = text.encode("utf-8", "ignore").decode("utf-8", "ignore")
             parts.append(text)
 
@@ -357,11 +356,13 @@ async def upload_meeting_notes(
     logger.info(f"[{current_user.email}][{conv_id}] Route: {route}")
 
     if route == "MEETING_NOTES":
+        # Full reset — allow re-running the pipeline in the same session
         bs.pipeline_stage   = "uploaded"
         bs.proposed_changes = None
         bs.review_index     = "0"
         bs.final_backlog    = None
         bs.changelog        = None
+        bs.langsmith_run_id = None
         bs.updated_at       = datetime.now(timezone.utc)
         await db.commit()
 
@@ -379,9 +380,12 @@ async def upload_meeting_notes(
         return {"status": "ok", "route": "MEETING_NOTES", "chars": len(raw_text)}
 
     else:
-        bs.pipeline_stage = "general_query"
-        bs.updated_at     = datetime.now(timezone.utc)
-        await db.commit()
+        # General question — only update stage if not currently in review
+        # so a follow-up question doesn't break an in-progress review.
+        if bs.pipeline_stage not in ("review",):
+            bs.pipeline_stage = "general_query"
+            bs.updated_at     = datetime.now(timezone.utc)
+            await db.commit()
 
         await _save_message(conv_id, "user", raw_text, msg_type="text")
         await _save_message(conv_id, "system", raw_text, msg_type="general_query")
@@ -425,14 +429,18 @@ async def general_stream(
             Message.conversation_id == conv_id,
             Message.role.in_(["user", "assistant"]),
             Message.msg_type.notin_(["meeting_notes", "general_query", "pinecone_snapshot"]),
-        ).order_by(Message.created_at.asc()).limit(60)   # fetch more, compressor will trim
+        ).order_by(Message.created_at.asc()).limit(60)
     )
     raw_history = [
         {"role": m.role, "content": m.content}
         for m in history_result.scalars().all()
         if m.content != question
     ]
-    history = await compress_history(raw_history) 
+    history = await compress_history(raw_history)
+
+    # Capture whether there's a final backlog before streaming so we can
+    # restore the correct stage afterwards.
+    has_final_backlog = bool(bs.final_backlog)
 
     async def event_gen() -> AsyncIterator[str]:
         answer_parts: list[str] = []
@@ -453,12 +461,13 @@ async def general_stream(
         if final_answer:
             await _save_message(conv_id, "assistant", final_answer, msg_type="text")
 
+        # Restore correct stage:
+        #   - "done"  if a final backlog exists (user can download + run again)
+        #   - "idle"  otherwise (ready for first pipeline run)
         async with AsyncSessionLocal() as save_db:
             bs2 = await save_db.get(BacklogSession, bs.id)
             if bs2:
-                # Preserve 'done' if backlog was already finalized so that
-                # follow-up questions asked after review don't break the UI.
-                bs2.pipeline_stage = "done" if bs2.final_backlog else "idle"
+                bs2.pipeline_stage = "done" if has_final_backlog else "idle"
                 bs2.updated_at     = datetime.now(timezone.utc)
                 await save_db.commit()
 
@@ -486,8 +495,14 @@ async def process_stream(
         select(BacklogSession).where(BacklogSession.conversation_id == conv_id)
     )
     bs = bs_result.scalar_one_or_none()
-    if not bs or bs.pipeline_stage not in ("uploaded",):
-        raise HTTPException(status_code=400, detail="No meeting notes uploaded yet, or pipeline already ran")
+
+    # Allow "uploaded" only — the upload endpoint is always called first and
+    # resets the stage to "uploaded" before this endpoint is hit.
+    if not bs or bs.pipeline_stage != "uploaded":
+        raise HTTPException(
+            status_code=400,
+            detail="No meeting notes ready to process. Upload meeting notes first."
+        )
 
     msg_result = await db.execute(
         select(Message).where(
@@ -575,7 +590,7 @@ async def process_stream(
                 async with AsyncSessionLocal() as s2:
                     bs2 = await s2.get(BacklogSession, bs.id)
                     if bs2:
-                        bs2.pipeline_stage = "done"
+                        bs2.pipeline_stage = "idle"
                         await s2.commit()
                 return
 
@@ -589,6 +604,13 @@ async def process_stream(
         except Exception as e:
             logger.error(f"[{conv_id}] Pipeline error: {e}", exc_info=True)
             yield _sse({"type": "error", "message": f"Pipeline error: {str(e)}"})
+            # Reset to idle so the user can try again
+            async with AsyncSessionLocal() as err_db:
+                bs_err = await err_db.get(BacklogSession, bs.id)
+                if bs_err:
+                    bs_err.pipeline_stage = "idle"
+                    bs_err.updated_at     = datetime.now(timezone.utc)
+                    await err_db.commit()
 
     return StreamingResponse(
         event_gen(),
@@ -796,7 +818,8 @@ async def submit_review(
             f"**{len(final_backlog)}** total stories\n\n"
             f"### Changelog\n" + "\n".join(cl_lines) +
             pinecone_line +
-            f"\n\n---\nClick **Download Backlog** to export `backlog_updated.json`."
+            f"\n\n---\nYou can now download the updated backlog, ask follow-up questions, "
+            f"or paste new meeting notes to run another update."
         )
         await _save_message(conv_id, "assistant", summary, msg_type="result")
 
@@ -913,11 +936,12 @@ async def session_status(
     )
     bs = bs_result.scalar_one_or_none()
     if not bs:
-        return {"stage": "idle", "review_index": 0, "total_changes": 0}
+        return {"stage": "idle", "review_index": 0, "total_changes": 0, "has_final_backlog": False}
     return {
-        "stage":         bs.pipeline_stage,
-        "review_index":  int(bs.review_index or "0"),
-        "total_changes": len(bs.proposed_changes or []),
+        "stage":             bs.pipeline_stage,
+        "review_index":      int(bs.review_index or "0"),
+        "total_changes":     len(bs.proposed_changes or []),
+        "has_final_backlog": bool(bs.final_backlog),
     }
 
 

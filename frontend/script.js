@@ -6,7 +6,7 @@ let currentConvId   = null;
 let isLoginMode     = true;
 let notesFile       = null;
 let appInited       = false;
-let _pipelineDone   = false;
+let _hasFinalBacklog = false;   // true once a pipeline has been fully reviewed
 
 // ─── Theme ────────────────────────────────────────────────────────────────────
 function toggleTheme() {
@@ -111,7 +111,7 @@ function setUserDisplay(email) {
 }
 async function doLogout() {
   try { await apiFetch('/auth/logout', { method: 'POST', body: JSON.stringify({ refresh_token: getRefreshTok() }) }); } catch {}
-  clearTokens(); currentConvId = null; appInited = false; _pipelineDone = false;
+  clearTokens(); currentConvId = null; _hasFinalBacklog = false;
   document.getElementById('chat-box').innerHTML = '';
   document.getElementById('conversations-list').innerHTML = '';
   showAuth();
@@ -131,11 +131,12 @@ async function fetchConversations() {
 }
 async function createNewConversation() {
   const conv = await (await apiFetch('/conversations', { method: 'POST', body: JSON.stringify({ title: 'New Session' }) })).json();
-  currentConvId = conv.id; _pipelineDone = false;
+  currentConvId = conv.id; _hasFinalBacklog = false;
   document.getElementById('chat-box').innerHTML = '';
   document.getElementById('session-title-display').textContent = conv.title;
   document.getElementById('download-btn').classList.add('hidden');
   showPanel('upload');
+  _updateComposerPlaceholder();
   await loadConversations();
 }
 async function loadConversations() { renderSidebar(await fetchConversations()); }
@@ -159,7 +160,7 @@ function renderSidebar(convs) {
   });
 }
 async function switchConversation(id) {
-  currentConvId = id; _pipelineDone = false;
+  currentConvId = id; _hasFinalBacklog = false;
   document.getElementById('chat-box').innerHTML = '';
   await loadMessages(id); await loadConversations();
 }
@@ -176,52 +177,48 @@ async function loadMessages(id) {
   document.getElementById('session-title-display').textContent = id.slice(0, 8) + '…';
 
   if (status.stage === 'done') {
-    _pipelineDone = true;
-    forceDonePanel();
+    _hasFinalBacklog = true;
+    document.getElementById('download-btn').classList.remove('hidden');
+    showPanel('upload');
   } else if (status.stage === 'review') {
-    _pipelineDone = false;
     showPanel('review');
   } else {
-    _pipelineDone = false;
-    showPanel('upload');
     document.getElementById('download-btn').classList.add('hidden');
+    showPanel('upload');
   }
+  _updateComposerPlaceholder();
 }
 async function deleteConv(id) {
   if (!confirm('Delete this session?')) return;
   await apiFetch(`/conversations/${id}`, { method: 'DELETE' });
-  if (id === currentConvId) { currentConvId = null; _pipelineDone = false; await createNewConversation(); }
+  if (id === currentConvId) { currentConvId = null; _hasFinalBacklog = false; await createNewConversation(); }
   else await loadConversations();
 }
 
 // ─── Panel management ─────────────────────────────────────────────────────────
+// The composer (#upload-panel) is the ONE universal input — always shown except
+// during processing and review. #chat-input-bar is permanently retired.
 function showPanel(name) {
   document.getElementById('upload-panel').classList.toggle('hidden',   name !== 'upload');
   document.getElementById('processing-bar').classList.toggle('hidden', name !== 'processing');
   document.getElementById('review-panel').classList.toggle('hidden',   name !== 'review');
-  document.getElementById('chat-input-bar').classList.toggle('hidden',
-    name !== 'chat' && name !== 'done' && name !== 'review');
+  // chat-input-bar is always hidden — the composer replaces it
+  document.getElementById('chat-input-bar').classList.add('hidden');
 }
 
-// forceDonePanel: explicitly shows the done state — belt-AND-suspenders approach.
-// Uses both showPanel AND direct DOM manipulation so there's no ambiguity.
-function forceDonePanel() {
-  // Hide everything except chat input
-  document.getElementById('upload-panel').classList.add('hidden');
-  document.getElementById('processing-bar').classList.add('hidden');
-  document.getElementById('review-panel').classList.add('hidden');
-  // Force chat-input-bar visible — this is the critical line
-  document.getElementById('chat-input-bar').classList.remove('hidden');
-  document.getElementById('download-btn').classList.remove('hidden');
-  // Focus the input so user can type immediately
-  const inp = document.getElementById('user-input');
-  if (inp) inp.focus();
-}
-
-// restorePanel: after a stream ends, show correct panel based on _pipelineDone
+// Called after pipeline or general-answer stream completes — always restore composer.
 function restorePanel() {
-  if (_pipelineDone) forceDonePanel();
-  else showPanel('upload');
+  showPanel('upload');
+  _updateComposerPlaceholder();
+}
+
+// ─── Composer placeholder — context-aware ─────────────────────────────────────
+function _updateComposerPlaceholder() {
+  const ta = document.getElementById('notes-textarea');
+  if (!ta) return;
+  ta.placeholder = _hasFinalBacklog
+    ? 'Paste new meeting notes, ask a follow-up question, or 📎 attach a file…'
+    : 'Paste meeting notes, or 📎 attach a TXT / PDF…';
 }
 
 // ─── File handlers ────────────────────────────────────────────────────────────
@@ -246,7 +243,7 @@ function composerKeydown(e) {
   if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); runPipeline(); }
 }
 
-// ─── Run pipeline (from upload panel) ─────────────────────────────────────────
+// ─── Run pipeline (universal entry point from composer) ───────────────────────
 async function runPipeline() {
   const errEl    = document.getElementById('upload-error');
   const textArea = document.getElementById('notes-textarea').value.trim();
@@ -269,13 +266,19 @@ async function runPipeline() {
       method: 'POST', headers: { 'Authorization': `Bearer ${getToken()}` }, body: form,
     });
     if (!ur.ok) {
-      restorePanel(); appendMessage((await ur.json().catch(() => ({}))).detail || 'Upload failed', 'assistant', 'text', true); return;
+      restorePanel();
+      appendMessage((await ur.json().catch(() => ({}))).detail || 'Upload failed', 'assistant', 'text', true);
+      return;
     }
     const ud = await ur.json();
     if (ud.route === 'MEETING_NOTES') {
-      appendMessage(`📄 **Meeting notes loaded** · ${(ud.chars||0).toLocaleString()} chars`, 'assistant', 'text', true);
+      // New pipeline run — hide download btn until new review is complete
+      document.getElementById('download-btn').classList.add('hidden');
+      _hasFinalBacklog = false;
+      appendMessage(`📄 **Meeting notes loaded** · ${(ud.chars || 0).toLocaleString()} chars`, 'assistant', 'text', true);
       await streamPipeline();
     } else {
+      // General question — leave download btn as-is, just answer
       await streamGeneralAnswer();
     }
   } catch (e) { restorePanel(); appendMessage(`❌ ${e.message}`, 'assistant', 'text', true); }
@@ -289,7 +292,7 @@ async function streamPipeline() {
     method: 'POST', headers: { 'Authorization': `Bearer ${getToken()}` },
   });
   if (!res.ok) {
-    appendMessage(`❌ ${(await res.json().catch(()=>({}))).detail || 'Pipeline failed'}`, 'assistant', 'text', true);
+    appendMessage(`❌ ${(await res.json().catch(() => ({}))).detail || 'Pipeline failed'}`, 'assistant', 'text', true);
     restorePanel(); return;
   }
   await consumeSSE(res);
@@ -303,7 +306,7 @@ async function streamGeneralAnswer() {
     method: 'POST', headers: { 'Authorization': `Bearer ${getToken()}` },
   });
   if (!res.ok) {
-    appendMessage(`❌ ${(await res.json().catch(()=>({}))).detail || 'Search failed'}`, 'assistant', 'text', true);
+    appendMessage(`❌ ${(await res.json().catch(() => ({}))).detail || 'Search failed'}`, 'assistant', 'text', true);
     restorePanel(); return;
   }
   await consumeSSE(res);
@@ -325,7 +328,7 @@ async function consumeSSE(res) {
   } catch (e) { console.warn('SSE interrupted:', e); restorePanel(); }
 }
 
-// ─── SSE event handler (synchronous — no await inside) ───────────────────────
+// ─── SSE event handler ────────────────────────────────────────────────────────
 let _currentReviewData = null;
 function onSSE(ev) {
   switch (ev.type) {
@@ -356,17 +359,16 @@ function onSSE(ev) {
     }
 
     case 'answer':
-      // Remove any orphaned step bubbles (e.g. "Searching the web…" when 0 searches ran)
+      // Remove any orphaned step bubbles
       chatBox().querySelectorAll('.msg-system-step').forEach(el => el.remove());
       appendMessage(ev.message, 'assistant', 'text', true);
       restorePanel(); break;
 
     case 'done':
-      // Pipeline complete — clean up any step indicators, mark done, force chat input visible
+      // Pipeline complete with no review needed (0 changes)
       chatBox().querySelectorAll('.msg-system-step').forEach(el => el.remove());
       appendMessage(ev.message, 'assistant', 'result', true);
-      _pipelineDone = true;
-      forceDonePanel(); break;
+      restorePanel(); break;
 
     case 'error':
       appendMessage(`❌ ${ev.message}`, 'assistant', 'text', true);
@@ -391,15 +393,14 @@ async function sendReview(decision) {
       showPanel('review');
 
     } else if (data.status === 'done') {
-      _pipelineDone = true;
-      // Append the result message
+      _hasFinalBacklog = true;
       const el = document.createElement('div');
       el.className = 'msg msg-assistant'; el.innerHTML = renderMarkdown(data.summary || '');
       if (data.telemetry) el.appendChild(renderTelemetryPanel(data.telemetry));
       chatBox().appendChild(el); chatBox().scrollTop = chatBox().scrollHeight;
-      // Force the done panel — belt AND suspenders
-      forceDonePanel();
-      await loadConversations(); // update sidebar count without affecting panel
+      document.getElementById('download-btn').classList.remove('hidden');
+      restorePanel();
+      await loadConversations();
     }
   } catch (e) { hideLoading(); appendMessage(`❌ Error: ${e.message}`, 'assistant', 'text', true); }
 }
@@ -505,39 +506,16 @@ async function submitEdit() {
       chatBox().appendChild(el); chatBox().scrollTop = chatBox().scrollHeight;
       showPanel('review');
     } else if (data.status === 'done') {
-      _pipelineDone = true;
+      _hasFinalBacklog = true;
       const el = document.createElement('div');
       el.className = 'msg msg-assistant'; el.innerHTML = renderMarkdown(data.summary || '');
       if (data.telemetry) el.appendChild(renderTelemetryPanel(data.telemetry));
       chatBox().appendChild(el); chatBox().scrollTop = chatBox().scrollHeight;
-      forceDonePanel();
+      document.getElementById('download-btn').classList.remove('hidden');
+      restorePanel();
       await loadConversations();
     }
   } catch (e) { hideLoading(); appendMessage(`❌ Error: ${e.message}`, 'assistant', 'text', true); }
-}
-
-// ─── Follow-up chat (only available in done state) ────────────────────────────
-async function sendChat() {
-  const input = document.getElementById('user-input');
-  const text  = input.value.trim(); if (!text) return;
-  input.value = '';
-  appendMessage(text, 'user', 'text', true);
-  showPanel('processing');
-  document.getElementById('processing-label').textContent = 'Thinking…';
-  const form = new FormData(); form.append('meeting_notes_text', text);
-  try {
-    const ur = await fetch(`${API}/sessions/${currentConvId}/upload`, {
-      method: 'POST', headers: { 'Authorization': `Bearer ${getToken()}` }, body: form,
-    });
-    if (!ur.ok) {
-      appendMessage(`❌ ${(await ur.json().catch(()=>({}))).detail || 'Request failed'}`, 'assistant', 'text', true);
-      forceDonePanel(); return;
-    }
-    const { route } = await ur.json();
-    // _pipelineDone is true here; streamGeneralAnswer → onSSE('answer') → restorePanel() → forceDonePanel()
-    if (route === 'MEETING_NOTES') await streamPipeline();
-    else await streamGeneralAnswer();
-  } catch (e) { appendMessage(`❌ ${e.message}`, 'assistant', 'text', true); forceDonePanel(); }
 }
 
 // ─── Download backlog ─────────────────────────────────────────────────────────
