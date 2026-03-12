@@ -1,11 +1,7 @@
 """
 Web Search Agent
 ================
-Answers GENERAL_QUESTION intents using a plain LLM + tool loop 
-same pattern as the existing agent.py in the project.
-
-The LLM is bound to the Tavily search tool and loops until it stops
-making tool calls (= final answer reached) or hits max iterations.
+Answers GENERAL_QUESTION intents using a plain LLM + tool loop.
 """
 
 import os
@@ -58,8 +54,6 @@ async def stream_web_search_answer(
 ) -> AsyncIterator[str]:
     """
     Run the web-search tool loop and stream SSE events.
-    No AgentExecutor — just LLM.bind_tools() + a while loop,
-    identical to the run_tool_loop pattern in agent.py.
     """
     if not _TAVILY_API_KEY:
         yield _sse({"type": "error",
@@ -93,8 +87,6 @@ async def stream_web_search_answer(
     messages = [HumanMessage(content=system_prompt)]
 
     search_count = 0
-    yield _sse({"type": "step", "step": 1, "message": "🌐 Searching the web…"})
-
     try:
         while True:
             logger.info(f"[WebSearchAgent] Iteration {search_count + 1}")
@@ -116,6 +108,10 @@ async def stream_web_search_answer(
                 query        = tool_call["args"].get("query", str(tool_call["args"]))
                 tool_call_id = tool_call.get("id")
 
+                # Emit the "Searching the web…" step indicator only on first real search
+                if search_count == 1:
+                    yield _sse({"type": "step", "step": 1, "message": "🌐 Searching the web…"})
+
                 yield _sse({
                     "type":    "step_done",
                     "step":    search_count,
@@ -131,7 +127,6 @@ async def stream_web_search_answer(
                     "tool_call_id": tool_call_id,
                 }
                 messages.append(tool_msg)
-
 
     except Exception as e:
         logger.error(f"[WebSearchAgent] Error: {e}")

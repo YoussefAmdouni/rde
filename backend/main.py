@@ -456,7 +456,9 @@ async def general_stream(
         async with AsyncSessionLocal() as save_db:
             bs2 = await save_db.get(BacklogSession, bs.id)
             if bs2:
-                bs2.pipeline_stage = "idle"
+                # Preserve 'done' if backlog was already finalized so that
+                # follow-up questions asked after review don't break the UI.
+                bs2.pipeline_stage = "done" if bs2.final_backlog else "idle"
                 bs2.updated_at     = datetime.now(timezone.utc)
                 await save_db.commit()
 
