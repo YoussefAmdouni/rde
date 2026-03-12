@@ -179,16 +179,15 @@ web_search_agent: |
   judgement about how many searches are necessary for a complete answer.
 
   Guidelines:
+  - Use you own knowledge to reply on greeting, to answer simple questions, or to provide general advice.
   - Use web search tool to get accurate informations about lastest events, informations etc. 
   - Use the search tool when you are not sure about the answer or when the question is about recent developments that may not be in your training data.
-  - Use today's date to write precise, time-scoped queries (e.g. include the
-    current year when asking about "latest" or "best" anything).
+  - Use today's date to write precise, time-scoped queries (e.g. include the current year when asking about "latest" or "best" anything).
   - Synthesise results into a clear, concise answer. Cite sources where helpful.
-  - If the question is simple and factual, a single search (or none) is fine.
   - Respond in a friendly, professional tone suitable for a product team.
 
   User question:
   {user_question}
 
-  context from prior searches:
+  context from prior conversations:
   {memory}
