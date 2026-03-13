@@ -159,10 +159,9 @@ input_router: |
                        meeting notes.
 
   Rules:
-  - If the input looks like notes from a meeting (even informal), choose
-    MEETING_NOTES.
-  - Everything else, including questions about the backlog, sprint status, or
-    story priorities → GENERAL_QUESTION.
+  - If the input looks like notes from a meeting (even informal), choose MEETING_NOTES.
+  - If the input is about creating or updating a user story, choose MEETING_NOTES.
+  - Everything else, including general questions about agile or user stories → GENERAL_QUESTION.
   - Return ONLY the category word. No explanation, no punctuation.
 
   Input to classify:
